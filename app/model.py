@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+import threading
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -32,6 +34,11 @@ _DRAFT_NOISE_SIGMA = 0.125
 VOCAB_SIZE = tokenizer.VOCAB_SIZE
 D_MODEL = 128
 MAX_POS = 256
+# 目标模型结构（注意力头重排导出功能据此校验块号与排列长度）
+TARGET_LAYERS = 4
+TARGET_HEADS = 4
+DRAFT_LAYERS = 1
+DRAFT_HEADS = 2
 
 
 class CausalTransformer(nn.Module):
@@ -177,6 +184,11 @@ class CausalTransformer(nn.Module):
         return logits if batched else logits.squeeze(0)
 
 
+# 构建锁：_build_pair 通过 torch.manual_seed 重置全局 RNG 再初始化模块，
+# 并发构建（如多个头重排导出同时进行）时必须串行，否则权重会被交叉污染。
+_BUILD_LOCK = threading.Lock()
+
+
 def _build_pair() -> tuple[CausalTransformer, CausalTransformer]:
     """以固定种子构建草稿/目标模型，共享嵌入与 LM head。
 
@@ -184,36 +196,39 @@ def _build_pair() -> tuple[CausalTransformer, CausalTransformer]:
     固定种子生成器注入受控高斯扰动，使两模型既有分歧（触发拒绝）又不会
     完全不同（保留整块接受）。全部权重确定可复现，无任何下载。
     """
-    torch.manual_seed(_WEIGHT_SEED)
-    shared_emb = nn.Embedding(VOCAB_SIZE, D_MODEL)
-    shared_head = nn.Linear(D_MODEL, VOCAB_SIZE, bias=False)
-    # 权重绑定：head 权重与嵌入转置共享，保证两个模型输出层完全一致
-    shared_head.weight = shared_emb.weight
+    with _BUILD_LOCK:
+        torch.manual_seed(_WEIGHT_SEED)
+        shared_emb = nn.Embedding(VOCAB_SIZE, D_MODEL)
+        shared_head = nn.Linear(D_MODEL, VOCAB_SIZE, bias=False)
+        # 权重绑定：head 权重与嵌入转置共享，保证两个模型输出层完全一致
+        shared_head.weight = shared_emb.weight
 
-    target = CausalTransformer(VOCAB_SIZE, D_MODEL, n_heads=4, n_layers=4)
-    draft = CausalTransformer(VOCAB_SIZE, D_MODEL, n_heads=2, n_layers=1)
-    target.tok_emb = draft.tok_emb = shared_emb
-    target.lm_head = draft.lm_head = shared_head
+        target = CausalTransformer(VOCAB_SIZE, D_MODEL,
+                                   n_heads=TARGET_HEADS, n_layers=TARGET_LAYERS)
+        draft = CausalTransformer(VOCAB_SIZE, D_MODEL,
+                                  n_heads=DRAFT_HEADS, n_layers=DRAFT_LAYERS)
+        target.tok_emb = draft.tok_emb = shared_emb
+        target.lm_head = draft.lm_head = shared_head
 
-    # 对草稿主体注入固定种子的受控扰动（共享的嵌入/输出层不扰动）
-    noise_gen = torch.Generator().manual_seed(_DRAFT_NOISE_SEED)
-    with torch.no_grad():
-        for p in draft.blocks.parameters():
-            p.add_(_DRAFT_NOISE_SIGMA * torch.randn(p.shape, generator=noise_gen))
-        for p in draft.pos_emb.parameters():
-            p.add_(_DRAFT_NOISE_SIGMA * torch.randn(p.shape, generator=noise_gen))
-        for p in draft.ln_f.parameters():
-            p.add_(0.1 * _DRAFT_NOISE_SIGMA
-                   * torch.randn(p.shape, generator=noise_gen))
+        # 对草稿主体注入固定种子的受控扰动（共享的嵌入/输出层不扰动）
+        noise_gen = torch.Generator().manual_seed(_DRAFT_NOISE_SEED)
+        with torch.no_grad():
+            for p in draft.blocks.parameters():
+                p.add_(_DRAFT_NOISE_SIGMA * torch.randn(p.shape, generator=noise_gen))
+            for p in draft.pos_emb.parameters():
+                p.add_(_DRAFT_NOISE_SIGMA * torch.randn(p.shape, generator=noise_gen))
+            for p in draft.ln_f.parameters():
+                p.add_(0.1 * _DRAFT_NOISE_SIGMA
+                       * torch.randn(p.shape, generator=noise_gen))
 
-    # 所有参数均确定可复现
-    target.eval()
-    draft.eval()
-    for p in target.parameters():
-        p.requires_grad_(False)
-    for p in draft.parameters():
-        p.requires_grad_(False)
-    return draft, target
+        # 所有参数均确定可复现
+        target.eval()
+        draft.eval()
+        for p in target.parameters():
+            p.requires_grad_(False)
+        for p in draft.parameters():
+            p.requires_grad_(False)
+        return draft, target
 
 
 _DRAFT: CausalTransformer | None = None
@@ -221,10 +236,17 @@ _TARGET: CausalTransformer | None = None
 
 
 def get_models() -> tuple[CausalTransformer, CausalTransformer]:
-    """返回进程内单例 (draft, target)。"""
+    """返回进程内单例 (draft, target)。
+
+    _build_pair 内部已持锁且结果确定可复现，并发首次访问时最多重复构建
+    一次（结果完全相同），仅最后一次赋值生效，无锁竞争风险。
+    """
     global _DRAFT, _TARGET
     if _TARGET is None:
-        _DRAFT, _TARGET = _build_pair()
+        pair = _build_pair()
+        with _BUILD_LOCK:
+            if _TARGET is None:
+                _DRAFT, _TARGET = pair
     return _DRAFT, _TARGET
 
 

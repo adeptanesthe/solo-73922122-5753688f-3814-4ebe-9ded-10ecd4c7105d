@@ -6,9 +6,16 @@ services:
       - "8000:8000"
     environment:
       - OMP_NUM_THREADS=2
+      - EXPORT_DIR=/srv/exports
+    volumes:
+      # 头重排导出的权重文件/报告持久化（可选，删除该行则仅存容器内）
+      - spec-decode-exports:/srv/exports
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health')"]
       interval: 15s
       timeout: 5s
       retries: 5
+
+volumes:
+  spec-decode-exports:

@@ -5,14 +5,15 @@ from __future__ import annotations
 import os
 from dataclasses import asdict
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import tokenizer
 from .decoding import compare
-from .model import get_models
+from .headperm import export_head_permutation, get_report, resolve_export_file
+from .model import TARGET_HEADS, TARGET_LAYERS, get_models
 
 app = FastAPI(title="Speculative Decoding Verifier")
 
@@ -55,6 +56,14 @@ class DecodeRequest(BaseModel):
     prompt: str = Field(default="", max_length=200)
     k: int = Field(default=3, ge=1, le=4)
     max_new: int = Field(default=32, ge=1, le=32)
+
+
+class HeadPermExportRequest(BaseModel):
+    """注意力头重排导出请求：块号 + 非原顺序的 4 头排列 + 1~3 条提示词。"""
+    block: int = Field(ge=0, le=TARGET_LAYERS - 1)
+    order: list[int] = Field(min_length=TARGET_HEADS, max_length=TARGET_HEADS)
+    prompts: list[str] = Field(min_length=1, max_length=3)
+    max_new: int = Field(default=8, ge=1, le=8)
 
 
 def _token_view(ids: list[int]) -> list[dict]:
@@ -123,6 +132,45 @@ def decode(req: DecodeRequest) -> JSONResponse:
 def presets() -> dict:
     """返回固定的两条预设（由测试套件锁定其判定类型，避免请求时全量扫描）。"""
     return {"reject": PRESET_REJECT, "all_accepted": PRESET_ALL_ACCEPTED}
+
+
+# ---- 注意力头重排导出（设备端指定头顺序）----
+
+
+@app.post("/api/headperm/export")
+def headperm_export(req: HeadPermExportRequest) -> JSONResponse:
+    """重排指定块的注意力头并产出可重载权重文件。
+
+    核对（原模型 vs 从文件重载的模型：无缓存与 KV 增量 logits 误差 ≤1e-3、
+    贪心续写逐 token 一致、权重绑定保留）全部通过才提供下载；
+    失败仅返回报告，不留文件。
+    """
+    try:
+        report = export_head_permutation(req.block, req.order, req.prompts, req.max_new)
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    return JSONResponse(report)
+
+
+@app.get("/api/headperm/{export_id}")
+def headperm_report(export_id: str) -> JSONResponse:
+    """按 export_id 取回某次提交的报告（与下载文件一一对应）。"""
+    report = get_report(export_id)
+    if report is None:
+        return JSONResponse(status_code=404, content={"error": "报告不存在。"})
+    return JSONResponse(report)
+
+
+@app.get("/api/headperm/{export_id}/download")
+def headperm_download(export_id: str) -> Response:
+    """下载某次核对通过的权重文件（核对失败的提交没有文件，返回 404）。"""
+    path = resolve_export_file(export_id)
+    if path is None:
+        return JSONResponse(status_code=404,
+                            content={"error": "文件不存在（核对未通过或已清理）。"})
+    report = get_report(export_id) or {}
+    filename = report.get("download_name", os.path.basename(path))
+    return FileResponse(path, media_type="application/octet-stream", filename=filename)
 
 
 @app.get("/")

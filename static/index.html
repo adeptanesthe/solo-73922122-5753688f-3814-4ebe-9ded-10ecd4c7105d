@@ -25,7 +25,7 @@
     border-radius: 10px; padding: 18px; margin-bottom: 20px;
   }
   label { display: block; color: var(--muted); margin-bottom: 6px; font-size: 12px; }
-  textarea, input[type=number] {
+  textarea, input[type=number], input[type=text], select {
     width: 100%; background: #0c1116; color: var(--txt);
     border: 1px solid var(--line); border-radius: 6px; padding: 10px;
     font-family: inherit; font-size: 14px;
@@ -155,6 +155,86 @@
           </tr>
         </thead>
         <tbody id="roundBody"></tbody>
+      </table>
+    </section>
+  </section>
+
+  <section class="panel">
+    <h3>注意力头重排导出（设备端指定顺序 · 目标模型单个块 · 4 头）</h3>
+    <p style="color:var(--muted);margin:0 0 12px;font-size:12px">
+      选择一个块与非原顺序的头排列（order[i] = 新位置 i 放置的原头编号），
+      Q/K/V 投影与输出投影将同步改排；共享词嵌入与输出层保持权重绑定，上方解码仍使用旧权重。
+      核对全部通过（无缓存与 KV 增量 logits 误差 ≤1e-3、贪心续写逐 token 一致）才提供权重文件下载。
+    </p>
+    <div class="row">
+      <div>
+        <label for="hpBlock">目标模型的块（0～3）</label>
+        <select id="hpBlock"></select>
+      </div>
+      <div>
+        <label for="hpOrder">头排列（非原顺序，共 23 种）</label>
+        <select id="hpOrder"></select>
+      </div>
+      <div>
+        <label for="hpMaxNew">贪心续写长度（1～8）</label>
+        <input type="number" id="hpMaxNew" min="1" max="8" value="8" />
+      </div>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <div>
+        <label for="hpPrompt1">提示词 1（必填，1～32 个可打印 ASCII）</label>
+        <input type="text" id="hpPrompt1" maxlength="32" value="the quick brown fox " />
+      </div>
+      <div>
+        <label for="hpPrompt2">提示词 2（可选）</label>
+        <input type="text" id="hpPrompt2" maxlength="32" value="hello world, this is " />
+      </div>
+      <div>
+        <label for="hpPrompt3">提示词 3（可选）</label>
+        <input type="text" id="hpPrompt3" maxlength="32" value="" />
+      </div>
+    </div>
+    <div style="margin-top:14px">
+      <button id="hpRun">重排并核对导出</button>
+      <span style="color:var(--muted);font-size:12px;margin-left:10px">
+        每次提交生成独立 export_id，报告与文件一一对应
+      </span>
+    </div>
+    <div class="err hidden" id="hpErr"></div>
+  </section>
+
+  <section id="hpResult" class="hidden">
+    <section class="panel">
+      <span id="hpBadge" class="badge pass">PASS</span>
+      <span style="color:var(--muted);margin-left:10px" id="hpStatusText"></span>
+      <div id="hpFailNote" class="mismatch-note hidden"></div>
+      <div class="grid2" style="margin-top:12px">
+        <div>
+          <div class="metric"><span>export_id</span><b id="hpId" style="font-size:11px">-</b></div>
+          <div class="metric"><span>块 / 头排列</span><b id="hpWhat">-</b></div>
+          <div class="metric"><span>嵌入 ↔ 输出层权重绑定</span><b id="hpTied">-</b></div>
+        </div>
+        <div>
+          <div class="metric"><span>无缓存 logits 最大误差</span><b id="hpErrNc">-</b></div>
+          <div class="metric"><span>KV 增量 logits 最大误差</span><b id="hpErrKv">-</b></div>
+          <div class="metric"><span>贪心序列全部一致</span><b id="hpGreedy">-</b></div>
+        </div>
+      </div>
+      <div id="hpDownload" class="hidden" style="margin-top:12px">
+        <a id="hpDownloadLink" href="#"><button type="button">下载权重文件</button></a>
+        <span style="color:var(--muted);font-size:12px;margin-left:10px" id="hpFileInfo"></span>
+      </div>
+    </section>
+    <section class="panel">
+      <h3>逐提示词核对明细（原模型 vs 重载文件）</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>提示词</th><th>无缓存误差</th><th>KV 增量误差</th>
+            <th>贪心一致</th><th>贪心续写 token</th>
+          </tr>
+        </thead>
+        <tbody id="hpBody"></tbody>
       </table>
     </section>
   </section>
@@ -299,6 +379,147 @@ function render(d) {
 }
 
 loadPresets();
+
+// ---- 注意力头重排导出 ----
+
+function permutations4() {
+  // 生成 [0,1,2,3] 的全部非恒等排列（23 种）
+  const out = [];
+  const used = [false, false, false, false];
+  const cur = [];
+  (function dfs() {
+    if (cur.length === 4) {
+      if (!(cur[0] === 0 && cur[1] === 1 && cur[2] === 2 && cur[3] === 3)) {
+        out.push(cur.slice());
+      }
+      return;
+    }
+    for (let i = 0; i < 4; i++) {
+      if (!used[i]) {
+        used[i] = true; cur.push(i);
+        dfs();
+        cur.pop(); used[i] = false;
+      }
+    }
+  })();
+  return out;
+}
+
+function initHeadPermForm() {
+  const blk = $("hpBlock");
+  for (let i = 0; i < 4; i++) {
+    const o = document.createElement("option");
+    o.value = i; o.textContent = "块 " + i;
+    blk.appendChild(o);
+  }
+  blk.value = "0";
+  const ord = $("hpOrder");
+  permutations4().forEach((p) => {
+    const o = document.createElement("option");
+    o.value = p.join(",");
+    o.textContent = "[" + p.join(" ") + "]　新位置 ← 原头";
+    ord.appendChild(o);
+  });
+  // 默认选一个常见的交换 [1 0 2 3]
+  ord.value = "1,0,2,3";
+}
+
+function fmtErr(x) {
+  if (x === 0) return "0";
+  return x.toExponential(2);
+}
+
+$("hpRun").onclick = async () => {
+  $("hpErr").classList.add("hidden");
+  const prompts = [$("hpPrompt1").value, $("hpPrompt2").value, $("hpPrompt3").value]
+    .filter((s) => s.length > 0);
+  const body = {
+    block: parseInt($("hpBlock").value, 10),
+    order: $("hpOrder").value.split(",").map((s) => parseInt(s, 10)),
+    prompts: prompts,
+    max_new: parseInt($("hpMaxNew").value, 10),
+  };
+  let d;
+  try {
+    const r = await fetch("/api/headperm/export", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(body),
+    });
+    d = await r.json();
+    if (!r.ok) {
+      $("hpErr").textContent = d.error || ("请求失败（" + r.status + "）");
+      $("hpErr").classList.remove("hidden");
+      return;
+    }
+  } catch (e) {
+    $("hpErr").textContent = String(e);
+    $("hpErr").classList.remove("hidden");
+    return;
+  }
+  renderHeadPerm(d);
+};
+
+function renderHeadPerm(d) {
+  $("hpResult").classList.remove("hidden");
+  const pass = d.status === "PASS";
+  const badge = $("hpBadge");
+  badge.textContent = d.status;
+  badge.className = "badge " + (pass ? "pass" : "fail");
+  $("hpStatusText").textContent = pass
+    ? "核对全部通过，权重文件可下载（阈值 ≤ " + d.tolerance + "）"
+    : "核对失败，不提供权重文件";
+
+  const note = $("hpFailNote");
+  if (pass) {
+    note.classList.add("hidden");
+  } else {
+    note.classList.remove("hidden");
+    note.innerHTML = "<b>失败原因：</b>" + (d.fail_reasons || []).join("；");
+  }
+
+  $("hpId").textContent = d.export_id;
+  $("hpWhat").textContent = "块 " + d.block + " / [" + d.order.join(" ") + "]";
+  $("hpTied").textContent = d.tied_weights_preserved ? "保留 ✓" : "丢失 ✗";
+  $("hpErrNc").textContent = fmtErr(d.max_abs_err_nocache);
+  $("hpErrKv").textContent = fmtErr(d.max_abs_err_kv);
+  $("hpGreedy").textContent = d.greedy_all_match ? "是 ✓" : "否 ✗";
+
+  const dl = $("hpDownload");
+  if (pass && d.download_url) {
+    dl.classList.remove("hidden");
+    $("hpDownloadLink").href = d.download_url;
+    $("hpFileInfo").textContent = d.download_name + " · " + d.file_bytes +
+      " 字节 · sha256 " + d.sha256.slice(0, 16) + "…";
+  } else {
+    dl.classList.add("hidden");
+  }
+
+  const body = $("hpBody");
+  body.innerHTML = "";
+  d.prompts.forEach((p) => {
+    const tr = document.createElement("tr");
+    const cells = [
+      () => document.createTextNode(JSON.stringify(p.prompt)),
+      () => document.createTextNode(fmtErr(p.max_abs_err_nocache)),
+      () => document.createTextNode(fmtErr(p.max_abs_err_kv)),
+      () => {
+        const s = document.createElement("span");
+        s.textContent = p.greedy_match ? "一致 ✓" : "不一致 ✗";
+        s.style.color = p.greedy_match ? "var(--ok)" : "var(--bad)";
+        return s;
+      },
+      () => {
+        const div = document.createElement("div");
+        p.greedy_tokens_view.forEach((t) => div.appendChild(miniTok(t.text, t.id)));
+        return div;
+      },
+    ];
+    cells.forEach((make) => { const td = document.createElement("td"); td.appendChild(make()); tr.appendChild(td); });
+    body.appendChild(tr);
+  });
+}
+
+initHeadPermForm();
 </script>
 </body>
 </html>
